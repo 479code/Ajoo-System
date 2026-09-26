@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { checkPin, setPaymentDetails } from "@/lib/sheets";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 30;
 
 export async function POST(req: Request) {
   try {

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { checkPin, changePin, setPin } from "@/lib/sheets";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 30;
 
 // One endpoint for the three PIN actions the old google.script.run API
 // exposed as api_setPin / api_verifyPin / api_changePin.

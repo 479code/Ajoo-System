@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { checkPin, getState, saveState, patchCurrentPayment, findBatch } from "@/lib/sheets";
+import { checkPin, getFreshStateForMutation, saveStateDiff, patchCurrentPayment, findBatch, type RawRows } from "@/lib/sheets";
 import {
   doCreateBatch,
   doEditBatch,
@@ -14,6 +14,12 @@ import {
 import type { LedgerState } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
+// Extra headroom above Vercel's 10s default: a clear-and-rewrite of several
+// sheets can occasionally run long, and a killed function returns a
+// non-JSON timeout page that the client can't parse — surfacing as a
+// generic "Server error" toast even though the mutation may have partly
+// gone through. More time to finish cleanly is cheaper than that ambiguity.
+export const maxDuration = 30;
 
 // NOTE on concurrency: the Apps Script version serialized every write with
 // LockService so two admins tapping at once couldn't clobber each other.
@@ -42,7 +48,7 @@ export async function POST(req: Request) {
   }
 
   try {
-    const state: LedgerState = await getState();
+    const { state, raw }: { state: LedgerState; raw: RawRows } = await getFreshStateForMutation();
 
     switch (action) {
       case "createBatch":
@@ -85,7 +91,7 @@ export async function POST(req: Request) {
       const tb = findBatch(state, batchId);
       await patchCurrentPayment(batchId, payerId, tb ? (tb.currentPayments[payerId] as string) || "pending" : "pending");
     } else {
-      await saveState(state);
+      await saveStateDiff(state, raw);
     }
 
     return NextResponse.json(state);

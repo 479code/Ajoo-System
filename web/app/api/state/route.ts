@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getState } from "@/lib/sheets";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 30;
 
 export async function GET() {
   try {

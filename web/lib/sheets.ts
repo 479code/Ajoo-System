@@ -43,6 +43,17 @@ let sheetIdsCache: Record<string, number> | null = null;
 // API read on every poll, on top of everything else.
 let sheetsEnsuredCache = false;
 
+// Short-lived cache for GET reads (page loads, the 45s poll, multiple
+// tabs/devices hitting the same warm instance close together). Any
+// successful write invalidates it immediately, so it never serves stale
+// data after a mutation from this instance — it only saves a round-trip
+// when nothing has changed.
+const STATE_CACHE_MS = 5000;
+let stateCache: { data: LedgerState; ts: number } | null = null;
+function invalidateStateCache(): void {
+  stateCache = null;
+}
+
 function getSpreadsheetId(): string {
   const id = process.env.GOOGLE_SHEET_ID;
   if (!id) throw new Error("GOOGLE_SHEET_ID env var is not set.");
@@ -113,6 +124,30 @@ async function writeAllRows(sheets: sheets_v4.Sheets, sheetName: string, rows: R
       requestBody: { values: rows },
     });
   }
+  invalidateStateCache();
+}
+
+// Every column value, padded out to a fixed width so a row missing trailing
+// (empty) cells — which the Sheets API omits rather than returning as ""
+// — still compares equal to the same row written out in full. Used to tell
+// whether a sheet's data actually changed before spending a write on it.
+function normalizeRowsForDiff(rows: Row[], width: number): string {
+  return JSON.stringify(
+    rows.map((r) => {
+      const out: Row = [];
+      for (let i = 0; i < width; i++) out.push(r[i] ?? "");
+      return out;
+    })
+  );
+}
+
+// Skips the clear-and-rewrite entirely when the sheet's data hasn't actually
+// changed. Most mutations (toggle archive, edit a name, move someone in the
+// queue) only touch one or two of the seven sheets — writing all seven every
+// time was the main reason mutations felt slow and occasionally timed out.
+async function writeRowsIfChanged(sheets: sheets_v4.Sheets, sheetName: string, newRows: Row[], oldRows: Row[], width: number): Promise<void> {
+  if (normalizeRowsForDiff(newRows, width) === normalizeRowsForDiff(oldRows, width)) return;
+  await writeAllRows(sheets, sheetName, newRows);
 }
 
 async function setPlainTextFormat(sheets: sheets_v4.Sheets, sheetName: string, columnIndex: number): Promise<void> {
@@ -232,6 +267,7 @@ async function setConfig(sheets: sheets_v4.Sheets, key: string, value: string): 
         valueInputOption: "RAW",
         requestBody: { values: [[value]] },
       });
+      invalidateStateCache();
       return;
     }
   }
@@ -241,6 +277,7 @@ async function setConfig(sheets: sheets_v4.Sheets, key: string, value: string): 
     valueInputOption: "RAW",
     requestBody: { values: [[key, value]] },
   });
+  invalidateStateCache();
 }
 
 export function hashPin(pin: string): string {
@@ -289,7 +326,20 @@ export async function setPaymentDetails(pd: PaymentDetails): Promise<void> {
   await setConfig(sheets, "payBankName", String(pd.bankName || "").trim());
 }
 
-export async function getState(): Promise<LedgerState> {
+export interface RawRows {
+  batchRows: Row[];
+  pRows: Row[];
+  spRows: Row[];
+  qRows: Row[];
+  hRows: Row[];
+  hpRows: Row[];
+  cpRows: Row[];
+}
+
+// The uncached read: always hits the Sheets API for a fresh snapshot, and
+// hands back the raw rows alongside the parsed state so a mutation can later
+// diff against exactly what it started from (see saveStateDiff).
+async function getStateAndRaw(): Promise<{ state: LedgerState; raw: RawRows }> {
   const sheets = getClient();
   await ensureSheets(sheets);
 
@@ -428,7 +478,9 @@ export async function getState(): Promise<LedgerState> {
     if (r[0] != null && r[0] !== "") configMap[String(r[0])] = String(r[1] ?? "");
   }
 
-  return {
+  const raw: RawRows = { batchRows, pRows, spRows, qRows, hRows, hpRows, cpRows };
+
+  const state: LedgerState = {
     batches,
     pinSet: !!configMap["pinHash"],
     paymentDetails: {
@@ -437,12 +489,27 @@ export async function getState(): Promise<LedgerState> {
       bankName: configMap["payBankName"] || "",
     },
   };
+
+  return { state, raw };
 }
 
-export async function saveState(state: LedgerState): Promise<void> {
-  const sheets = getClient();
-  await ensureSheets(sheets);
+// Cached read for plain page loads and the client's poll — served instantly
+// when nothing has changed since the last read in this warm instance, since
+// invalidateStateCache() clears it the moment any write actually happens.
+export async function getState(): Promise<LedgerState> {
+  if (stateCache && Date.now() - stateCache.ts < STATE_CACHE_MS) return stateCache.data;
+  const { state } = await getStateAndRaw();
+  stateCache = { data: state, ts: Date.now() };
+  return state;
+}
 
+// Used by the mutate route: needs a guaranteed-fresh snapshot to mutate
+// (never the cache) plus the raw rows to diff the save against.
+export async function getFreshStateForMutation(): Promise<{ state: LedgerState; raw: RawRows }> {
+  return getStateAndRaw();
+}
+
+function buildRowsFromState(state: LedgerState) {
   const batchRows: Row[] = [BATCHES_HEADER];
   const participantRows: Row[] = [PARTICIPANTS_HEADER];
   const subPayerRows: Row[] = [SUB_PAYERS_HEADER];
@@ -470,6 +537,14 @@ export async function saveState(state: LedgerState): Promise<void> {
     Object.keys(b.currentPayments || {}).forEach((pid) => currentPaymentRows.push([b.id, pid, b.currentPayments[pid]]));
   });
 
+  return { batchRows, participantRows, subPayerRows, queueRows, historyRows, historyPaymentRows, currentPaymentRows };
+}
+
+export async function saveState(state: LedgerState): Promise<void> {
+  const sheets = getClient();
+  await ensureSheets(sheets);
+  const { batchRows, participantRows, subPayerRows, queueRows, historyRows, historyPaymentRows, currentPaymentRows } = buildRowsFromState(state);
+
   await Promise.all([
     writeAllRows(sheets, BATCHES_SHEET, batchRows),
     writeAllRows(sheets, PARTICIPANTS_SHEET, participantRows),
@@ -478,6 +553,29 @@ export async function saveState(state: LedgerState): Promise<void> {
     writeAllRows(sheets, HISTORY_SHEET, historyRows),
     writeAllRows(sheets, HISTORY_PAYMENTS_SHEET, historyPaymentRows),
     writeAllRows(sheets, CURRENT_PAYMENTS_SHEET, currentPaymentRows),
+  ]);
+}
+
+// Fast path for every mutation except togglePayment (which has its own
+// single-cell patch below): only the sheets whose rows actually changed get
+// cleared and rewritten, instead of all seven every time. Editing a batch
+// name, for instance, used to rewrite Participants, SubPayers, Queue,
+// History, HistoryPayments and CurrentPayments even though none of them
+// changed — this is what was making ordinary actions slow enough to
+// occasionally hit the serverless function's timeout ("Server error").
+export async function saveStateDiff(state: LedgerState, raw: RawRows): Promise<void> {
+  const sheets = getClient();
+  await ensureSheets(sheets);
+  const { batchRows, participantRows, subPayerRows, queueRows, historyRows, historyPaymentRows, currentPaymentRows } = buildRowsFromState(state);
+
+  await Promise.all([
+    writeRowsIfChanged(sheets, BATCHES_SHEET, batchRows, raw.batchRows, BATCHES_HEADER.length),
+    writeRowsIfChanged(sheets, PARTICIPANTS_SHEET, participantRows, raw.pRows, PARTICIPANTS_HEADER.length),
+    writeRowsIfChanged(sheets, SUB_PAYERS_SHEET, subPayerRows, raw.spRows, SUB_PAYERS_HEADER.length),
+    writeRowsIfChanged(sheets, QUEUE_SHEET, queueRows, raw.qRows, QUEUE_HEADER.length),
+    writeRowsIfChanged(sheets, HISTORY_SHEET, historyRows, raw.hRows, HISTORY_HEADER.length),
+    writeRowsIfChanged(sheets, HISTORY_PAYMENTS_SHEET, historyPaymentRows, raw.hpRows, HISTORY_PAYMENTS_HEADER.length),
+    writeRowsIfChanged(sheets, CURRENT_PAYMENTS_SHEET, currentPaymentRows, raw.cpRows, CURRENT_PAYMENTS_HEADER.length),
   ]);
 }
 
@@ -494,6 +592,7 @@ export async function patchCurrentPayment(batchId: string, payerId: string, stat
         valueInputOption: "RAW",
         requestBody: { values: [[status]] },
       });
+      invalidateStateCache();
       return;
     }
   }
@@ -503,6 +602,7 @@ export async function patchCurrentPayment(batchId: string, payerId: string, stat
     valueInputOption: "RAW",
     requestBody: { values: [[batchId, payerId, status]] },
   });
+  invalidateStateCache();
 }
 
 export { findBatchInState as findBatch };

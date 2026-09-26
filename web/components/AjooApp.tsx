@@ -41,7 +41,10 @@ import type {
 } from "@/lib/types";
 
 const PIN_STORAGE_KEY = "ajooAdminPin";
-const REFRESH_MS = 25000;
+// Each poll now costs one Sheets API read request (batched server-side), but
+// several people/tabs polling at once still adds up against the per-minute
+// quota, so this stays comfortably spaced out.
+const REFRESH_MS = 45000;
 
 type Filter = "all" | "active" | "completed" | "archived";
 

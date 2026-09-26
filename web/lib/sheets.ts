@@ -35,6 +35,13 @@ type Row = (string | number | boolean)[];
 
 let sheetsClient: sheets_v4.Sheets | null = null;
 let sheetIdsCache: Record<string, number> | null = null;
+// Once ensureSheets() has successfully run in this serverless instance, the
+// tabs/columns it checks can't disappear on their own — skip re-checking on
+// every single request. This is the main fix for the Sheets API "read
+// requests per minute" quota being blown through: without it, ensureSheets()
+// (via ensurePlainTextColumns' getConfig read) was burning an extra Sheets
+// API read on every poll, on top of everything else.
+let sheetsEnsuredCache = false;
 
 function getSpreadsheetId(): string {
   const id = process.env.GOOGLE_SHEET_ID;
@@ -77,6 +84,21 @@ async function getSheetIds(sheets: sheets_v4.Sheets): Promise<Record<string, num
 async function readRange(sheets: sheets_v4.Sheets, range: string): Promise<Row[]> {
   const res = await sheets.spreadsheets.values.get({ spreadsheetId: getSpreadsheetId(), range, valueRenderOption: "UNFORMATTED_VALUE" });
   return (res.data.values as Row[]) || [];
+}
+
+// Reads several ranges in a single Sheets API call instead of one call per
+// range. batchGet counts as ONE "read request" against the per-minute quota
+// no matter how many ranges it carries, so this is the key lever for
+// staying under "Read requests per minute per user" — getState() used to
+// spend 7+ separate read requests every time it ran.
+async function batchReadRanges(sheets: sheets_v4.Sheets, ranges: string[]): Promise<Row[][]> {
+  const res = await sheets.spreadsheets.values.batchGet({
+    spreadsheetId: getSpreadsheetId(),
+    ranges,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
+  const valueRanges = res.data.valueRanges || [];
+  return ranges.map((_, i) => (valueRanges[i]?.values as Row[]) || []);
 }
 
 async function writeAllRows(sheets: sheets_v4.Sheets, sheetName: string, rows: Row[]): Promise<void> {
@@ -131,6 +153,7 @@ async function ensureSheetExists(sheets: sheets_v4.Sheets, name: string, header:
 }
 
 async function ensureSheets(sheets: sheets_v4.Sheets): Promise<void> {
+  if (sheetsEnsuredCache) return;
   await ensureSheetExists(sheets, BATCHES_SHEET, BATCHES_HEADER);
   const participantsIsNew = await ensureSheetExists(sheets, PARTICIPANTS_SHEET, PARTICIPANTS_HEADER);
   await ensureSheetExists(sheets, SUB_PAYERS_SHEET, SUB_PAYERS_HEADER);
@@ -144,6 +167,7 @@ async function ensureSheets(sheets: sheets_v4.Sheets): Promise<void> {
     // below will format everything correctly for these fresh sheets anyway.
   }
   await ensurePlainTextColumns(sheets);
+  sheetsEnsuredCache = true;
 }
 
 // Several columns hold digit-only or date-shaped text ("08012345678",
@@ -269,14 +293,15 @@ export async function getState(): Promise<LedgerState> {
   const sheets = getClient();
   await ensureSheets(sheets);
 
-  const [batchRows, pRows, spRows, qRows, hRows, hpRows, cpRows] = await Promise.all([
-    readRange(sheets, BATCHES_SHEET),
-    readRange(sheets, PARTICIPANTS_SHEET),
-    readRange(sheets, SUB_PAYERS_SHEET),
-    readRange(sheets, QUEUE_SHEET),
-    readRange(sheets, HISTORY_SHEET),
-    readRange(sheets, HISTORY_PAYMENTS_SHEET),
-    readRange(sheets, CURRENT_PAYMENTS_SHEET),
+  const [batchRows, pRows, spRows, qRows, hRows, hpRows, cpRows, configRows] = await batchReadRanges(sheets, [
+    BATCHES_SHEET,
+    PARTICIPANTS_SHEET,
+    SUB_PAYERS_SHEET,
+    QUEUE_SHEET,
+    HISTORY_SHEET,
+    HISTORY_PAYMENTS_SHEET,
+    CURRENT_PAYMENTS_SHEET,
+    CONFIG_SHEET,
   ]);
 
   const batchesById: Record<string, Batch> = {};
@@ -397,13 +422,19 @@ export async function getState(): Promise<LedgerState> {
   const batches = order.map((id) => batchesById[id]);
   batches.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
 
+  const configMap: Record<string, string> = {};
+  for (let i = 1; i < configRows.length; i++) {
+    const r = configRows[i];
+    if (r[0] != null && r[0] !== "") configMap[String(r[0])] = String(r[1] ?? "");
+  }
+
   return {
     batches,
-    pinSet: !!(await getConfig(sheets, "pinHash")),
+    pinSet: !!configMap["pinHash"],
     paymentDetails: {
-      accountNumber: (await getConfig(sheets, "payAccountNumber")) || "",
-      accountName: (await getConfig(sheets, "payAccountName")) || "",
-      bankName: (await getConfig(sheets, "payBankName")) || "",
+      accountNumber: configMap["payAccountNumber"] || "",
+      accountName: configMap["payAccountName"] || "",
+      bankName: configMap["payBankName"] || "",
     },
   };
 }
